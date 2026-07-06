@@ -984,6 +984,8 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  handleLaunchVerifyResult,
+  formatLaunchFailureSummary,
   runningSubagents,
   formatElapsed,
 };
@@ -1597,6 +1599,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.error === "launch-failed"
+                    ? {
+                        error: result.error,
+                        surface: running.surface,
+                        launchScriptFile: running.launchScriptFile,
+                      }
+                    : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                 },
               },
@@ -1633,6 +1642,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             name: params.name,
             task: params.task,
             agent: params.agent,
+            surface: running.surface,
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
             status: "started",
@@ -2040,6 +2050,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: params.sessionPath,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.error === "launch-failed"
+                    ? {
+                        error: result.error,
+                        surface: running.surface,
+                        launchScriptFile: running.launchScriptFile,
+                      }
+                    : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2063,6 +2080,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           details: {
             id,
             name,
+            surface: running.surface,
             sessionPath: params.sessionPath,
             launchScriptFile,
             status: "started",
