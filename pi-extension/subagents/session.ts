@@ -19,9 +19,39 @@ export interface MessageEntry extends SessionEntry {
 
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
 
-function getForkContentLines(parentSessionFile: string): string[] {
+function getForkContentLines(
+  parentSessionFile: string,
+  forkFromEntryId?: string | null,
+): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
+
+  if (forkFromEntryId !== undefined) {
+    if (forkFromEntryId === null) return [];
+
+    const entries = lines
+      .map((line) => JSON.parse(line) as SessionEntry)
+      .filter((entry) => entry.type !== "session");
+    const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
+    const branch: SessionEntry[] = [];
+    const visited = new Set<string>();
+    let entry = entriesById.get(forkFromEntryId);
+
+    if (!entry) {
+      throw new Error(`Fork source entry not found: ${forkFromEntryId}`);
+    }
+
+    while (entry) {
+      if (visited.has(entry.id)) {
+        throw new Error(`Cycle detected in fork source branch at entry: ${entry.id}`);
+      }
+      visited.add(entry.id);
+      branch.unshift(entry);
+      entry = entry.parentId ? entriesById.get(entry.parentId) : undefined;
+    }
+
+    return branch.map((branchEntry) => JSON.stringify(branchEntry));
+  }
 
   let truncateAt = lines.length;
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -45,11 +75,25 @@ function getForkContentLines(parentSessionFile: string): string[] {
   });
 }
 
+export function getForkSourceEntryId(branch: SessionEntry[]): string | null | undefined {
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (
+      entry.type === "message" &&
+      (entry as MessageEntry).message.role === "user"
+    ) {
+      return entry.parentId ?? null;
+    }
+  }
+  return undefined;
+}
+
 export function seedSubagentSessionFile(params: {
   mode: SeededSubagentSessionMode;
   parentSessionFile: string;
   childSessionFile: string;
   childCwd: string;
+  forkFromEntryId?: string | null;
 }): void {
   const header = {
     type: "session",
@@ -60,7 +104,9 @@ export function seedSubagentSessionFile(params: {
     parentSession: params.parentSessionFile,
   };
   const contentLines =
-    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+    params.mode === "fork"
+      ? getForkContentLines(params.parentSessionFile, params.forkFromEntryId)
+      : [];
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });

@@ -10,6 +10,7 @@ import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
   getLeafId,
+  getForkSourceEntryId,
   getNewEntries,
   findLastAssistantMessage,
   appendBranchSummary,
@@ -249,6 +250,32 @@ describe("session.ts", () => {
     });
   });
 
+  describe("getForkSourceEntryId", () => {
+    it("returns the active leaf before the triggering user message", () => {
+      const triggeringUser = {
+        ...USER_MSG,
+        id: "user-iterate",
+        parentId: ASSISTANT_MSG.id,
+      };
+      const toolCallingAssistant = {
+        ...ASSISTANT_MSG,
+        id: "asst-iterate",
+        parentId: triggeringUser.id,
+      };
+
+      assert.equal(
+        getForkSourceEntryId([
+          MODEL_CHANGE,
+          USER_MSG,
+          ASSISTANT_MSG,
+          triggeringUser,
+          toolCallingAssistant,
+        ]),
+        ASSISTANT_MSG.id,
+      );
+    });
+  });
+
   describe("getNewEntries", () => {
     it("returns entries after a given line", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
@@ -455,6 +482,57 @@ describe("session.ts", () => {
       assert.equal(entries[1].type, "model_change");
       assert.equal(entries.some((entry) => entry.type === "session" && entry.parentSession !== parentFile), false);
       assert.equal(entries.some((entry) => entry.type === "message"), false);
+    });
+
+    it("forks from the selected branch point instead of the latest physical session entry", () => {
+      const abandonedUser = {
+        ...USER_MSG,
+        id: "user-abandoned",
+        parentId: ASSISTANT_MSG.id,
+      };
+      const abandonedAssistant = {
+        ...ASSISTANT_MSG,
+        id: "asst-abandoned",
+        parentId: abandonedUser.id,
+      };
+      const triggeringUser = {
+        ...USER_MSG,
+        id: "user-iterate",
+        parentId: ASSISTANT_MSG.id,
+      };
+      const toolCallingAssistant = {
+        ...ASSISTANT_MSG,
+        id: "asst-iterate",
+        parentId: triggeringUser.id,
+      };
+      const parentFile = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+        abandonedUser,
+        abandonedAssistant,
+        triggeringUser,
+        toolCallingAssistant,
+      ]);
+      const childFile = join(dir, "selected-branch-child.jsonl");
+
+      seedSubagentSessionFile({
+        mode: "fork",
+        parentSessionFile: parentFile,
+        childSessionFile: childFile,
+        childCwd: "/tmp/fork-child-cwd",
+        forkFromEntryId: ASSISTANT_MSG.id,
+      });
+
+      const entries = readFileSync(childFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.deepEqual(
+        entries.slice(1).map((entry) => entry.id),
+        [MODEL_CHANGE.id, USER_MSG.id, ASSISTANT_MSG.id],
+      );
     });
   });
 

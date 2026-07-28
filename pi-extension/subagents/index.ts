@@ -32,8 +32,10 @@ import {
 
 import {
   findLastAssistantMessage,
+  getForkSourceEntryId,
   getNewEntries,
   seedSubagentSessionFile,
+  type SessionEntry,
 } from "./session.ts";
 import {
   type StatusSnapshot,
@@ -1007,7 +1009,15 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: {
+    sessionManager: {
+      getSessionFile(): string | null;
+      getSessionId(): string;
+      getSessionDir(): string;
+      getBranch(): SessionEntry[];
+    };
+    cwd: string;
+  },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -1057,6 +1067,10 @@ async function launchSubagent(
       parentSessionFile: sessionFile,
       childSessionFile: subagentSessionFile,
       childCwd: targetCwdForSession,
+      forkFromEntryId:
+        launchBehavior.seededSessionMode === "fork"
+          ? getForkSourceEntryId(ctx.sessionManager.getBranch())
+          : undefined,
     });
   }
 
