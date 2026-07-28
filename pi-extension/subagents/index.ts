@@ -990,6 +990,7 @@ export const __test__ = {
   formatLaunchFailureSummary,
   runningSubagents,
   formatElapsed,
+  getModuleAbortSignal,
 };
 
 function startWidgetRefresh() {
@@ -1475,6 +1476,10 @@ async function watchSubagent(
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
+    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
+    if (!moduleAbort || moduleAbort.signal.aborted) {
+      (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+    }
     latestCtx = ctx;
   });
 

@@ -10,7 +10,7 @@
  *   tmux new 'npm run test:integration'
  *   zellij --session pi  # then run: npm run test:integration
  */
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
 import {
@@ -37,11 +37,11 @@ import {
   trackTempFile,
   waitForFile,
   waitForScreen,
+  SHELL_READY_DELAY_MS,
   type TestEnv,
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
-const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
 
 if (backends.length === 0) {
   console.log("⚠️  No mux backend available — skipping mux-surface integration tests");
@@ -55,27 +55,33 @@ for (const backend of backends) {
 
     before(() => {
       prevMux = setBackend(backend);
+    });
+
+    beforeEach(() => {
       env = createTestEnv(backend);
     });
 
-    after(() => {
+    afterEach(() => {
       cleanupTestEnv(env);
+    });
+
+    after(() => {
       restoreBackend(prevMux);
     });
 
     it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
       const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       focusSurface(backend, anchor);
       await waitForFocusedSurface(backend, anchor, 10_000);
 
       const childA = createTrackedSurface(env, "focus-child-a");
-      await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
+      await sleep(SHELL_READY_DELAY_MS);
       assert.equal(getFocusedSurface(backend), anchor);
 
       const childB = createTrackedSurface(env, "focus-child-b");
-      await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
+      await sleep(SHELL_READY_DELAY_MS);
       assert.equal(getFocusedSurface(backend), anchor);
 
       if (backend === "cmux") {
@@ -100,7 +106,7 @@ for (const backend of backends) {
 
     it("creates a surface, sends a command, reads output, and closes it", async () => {
       const surface = createTrackedSurface(env, "echo-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       sendCommand(surface, `echo "MARKER_${marker}"`);
@@ -118,7 +124,7 @@ for (const backend of backends) {
 
     it("preserves shell special characters in echo output", async () => {
       const surface = createTrackedSurface(env, "escape-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       // Single-quoted string — $ and " are literal inside single quotes
@@ -139,7 +145,7 @@ for (const backend of backends) {
 
     it("sends a long command via script file without truncation", async () => {
       const surface = createTrackedSurface(env, "long-cmd-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       const longValue = "X".repeat(500);
@@ -161,7 +167,7 @@ for (const backend of backends) {
 
     it("reads screen asynchronously", async () => {
       const surface = createTrackedSurface(env, "async-read-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       sendCommand(surface, `echo "ASYNC_${marker}"`);
@@ -177,7 +183,7 @@ for (const backend of backends) {
     it("manages multiple surfaces concurrently", async () => {
       const s1 = createTrackedSurface(env, "multi-1");
       const s2 = createTrackedSurface(env, "multi-2");
-      await sleep(1500);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const m1 = uniqueId();
       const m2 = uniqueId();
@@ -194,7 +200,7 @@ for (const backend of backends) {
 
     it("writes output to a file and verifies via surface", async () => {
       const surface = createTrackedSurface(env, "file-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       const filePath = `/tmp/pi-mux-test-${marker}.txt`;
@@ -213,7 +219,7 @@ for (const backend of backends) {
 
     it("delivers Escape as byte 27 to the target surface", async () => {
       const surface = createTrackedSurface(env, "escape-byte-test");
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const marker = uniqueId();
       const byteFile = `/tmp/pi-mux-escape-${marker}.txt`;

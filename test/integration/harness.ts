@@ -12,11 +12,11 @@ import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
-  cpSync,
   readdirSync,
   rmSync,
   existsSync,
   readFileSync,
+  writeFileSync,
   unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
@@ -74,7 +74,11 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 // ── Configuration ──
 
 /** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
+export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "openai-codex/gpt-5.4-mini";
+
+export const SHELL_READY_DELAY_MS = Number(
+  process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500",
+);
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
@@ -204,7 +208,9 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
+        const source = readFileSync(join(TEST_AGENTS_SRC, file), "utf8");
+        const configured = source.replace(/^model:\s*.+$/m, `model: ${TEST_MODEL}`);
+        writeFileSync(join(agentsDir, file), configured);
       }
     }
   }

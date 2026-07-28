@@ -1,7 +1,7 @@
 /**
  * Integration tests for the full subagent lifecycle.
  *
- * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
+ * These tests spawn REAL pi sessions with REAL LLM calls.
  * Each test creates a mux surface, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
@@ -13,10 +13,10 @@
  *   tmux new 'npm run test:integration'
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
+ *   PI_TEST_MODEL     — model for all pi sessions (default: openai-codex/gpt-5.4-mini)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import {
@@ -34,6 +34,7 @@ import {
   trackTempFile,
   readScreen,
   PI_TIMEOUT,
+  SHELL_READY_DELAY_MS,
   type TestEnv,
 } from "./harness.ts";
 
@@ -51,11 +52,17 @@ for (const backend of backends) {
 
     before(() => {
       prevMux = setBackend(backend);
+    });
+
+    beforeEach(() => {
       env = createTestEnv(backend);
     });
 
-    after(() => {
+    afterEach(() => {
       cleanupTestEnv(env);
+    });
+
+    after(() => {
       restoreBackend(prevMux);
     });
 
@@ -67,7 +74,7 @@ for (const backend of backends) {
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `echo-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
@@ -119,7 +126,7 @@ for (const backend of backends) {
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `status-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
@@ -164,7 +171,7 @@ for (const backend of backends) {
       trackTempFile(env, fileB);
 
       const surface = createTrackedSurface(env, `parallel-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `You must call the subagent tool TWICE. Make both calls before waiting for results.`,
@@ -202,7 +209,7 @@ for (const backend of backends) {
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `fork-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
@@ -250,7 +257,7 @@ for (const backend of backends) {
       const id = uniqueId();
 
       const surface = createTrackedSurface(env, `ping-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
@@ -284,7 +291,7 @@ for (const backend of backends) {
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `discovery-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       // Use subagents_list to verify test agents are discoverable,
       // then spawn one to prove it works end-to-end.
@@ -312,7 +319,7 @@ for (const backend of backends) {
       trackTempFile(env, markerFile);
 
       const surface = createTrackedSurface(env, `sysprompt-${id}`);
-      await sleep(1000);
+      await sleep(SHELL_READY_DELAY_MS);
 
       const task = [
         `Call the subagent tool with these parameters:`,

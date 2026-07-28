@@ -90,16 +90,20 @@ function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
+  const registeredEvents = new Map<string, Array<any>>();
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
+    registeredEvents,
     sentUserMessages,
     sentMessages,
     api: {
-      on() {},
+      on(event: string, handler: any) {
+        registeredEvents.set(event, [...(registeredEvents.get(event) ?? []), handler]);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -1498,6 +1502,24 @@ describe("tool registration", () => {
     const autoExitSchema = resumeTool.parameters.properties.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
     assert.match(autoExitSchema.description, /Defaults to true/);
+  });
+});
+
+describe("extension session lifecycle", () => {
+  it("rearms background polling after a replacement session starts", async () => {
+    const mock = createMockExtensionApi();
+    subagentsModule.default(mock.api);
+    const sessionStart = mock.registeredEvents.get("session_start")?.[0];
+    const sessionShutdown = mock.registeredEvents.get("session_shutdown")?.[0];
+
+    assert.ok(sessionStart);
+    assert.ok(sessionShutdown);
+
+    await sessionShutdown({ reason: "new" }, {});
+    assert.equal(subagentsModule.__test__.getModuleAbortSignal().aborted, true);
+
+    await sessionStart({ reason: "new" }, {});
+    assert.equal(subagentsModule.__test__.getModuleAbortSignal().aborted, false);
   });
 });
 
