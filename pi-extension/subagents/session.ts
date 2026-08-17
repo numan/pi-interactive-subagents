@@ -75,6 +75,36 @@ function getForkContentLines(
   });
 }
 
+function getForkContentLinesFromBranch(
+  parentBranch: SessionEntry[],
+  forkFromEntryId: string | null | undefined,
+): string[] {
+  if (forkFromEntryId === null) return [];
+  if (forkFromEntryId === undefined) {
+    return parentBranch.map((entry) => JSON.stringify(entry));
+  }
+
+  const entriesById = new Map(parentBranch.map((entry) => [entry.id, entry]));
+  const branch: SessionEntry[] = [];
+  const visited = new Set<string>();
+  let entry = entriesById.get(forkFromEntryId);
+
+  if (!entry) {
+    throw new Error(`Fork source entry not found: ${forkFromEntryId}`);
+  }
+
+  while (entry) {
+    if (visited.has(entry.id)) {
+      throw new Error(`Cycle detected in fork source branch at entry: ${entry.id}`);
+    }
+    visited.add(entry.id);
+    branch.unshift(entry);
+    entry = entry.parentId ? entriesById.get(entry.parentId) : undefined;
+  }
+
+  return branch.map((branchEntry) => JSON.stringify(branchEntry));
+}
+
 export function getForkSourceEntryId(branch: SessionEntry[]): string | null | undefined {
   for (let i = branch.length - 1; i >= 0; i--) {
     const entry = branch[i];
@@ -94,6 +124,7 @@ export function seedSubagentSessionFile(params: {
   childSessionFile: string;
   childCwd: string;
   forkFromEntryId?: string | null;
+  parentBranch?: SessionEntry[];
 }): void {
   const header = {
     type: "session",
@@ -105,7 +136,9 @@ export function seedSubagentSessionFile(params: {
   };
   const contentLines =
     params.mode === "fork"
-      ? getForkContentLines(params.parentSessionFile, params.forkFromEntryId)
+      ? params.parentBranch
+        ? getForkContentLinesFromBranch(params.parentBranch, params.forkFromEntryId)
+        : getForkContentLines(params.parentSessionFile, params.forkFromEntryId)
       : [];
   const lines = [JSON.stringify(header), ...contentLines];
 

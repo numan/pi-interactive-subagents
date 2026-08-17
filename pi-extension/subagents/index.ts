@@ -350,6 +350,13 @@ function resolveLaunchBehavior(
  * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
  * subagent is treated as interactive — matching the intent of iterate.
  */
+function resolveForkFromEntryId(
+  branch: SessionEntry[],
+  explicitForkFromEntryId?: string,
+): string | null | undefined {
+  return explicitForkFromEntryId ?? getForkSourceEntryId(branch);
+}
+
 function resolveEffectiveInteractive(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
@@ -975,6 +982,7 @@ export const __test__ = {
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
+  resolveForkFromEntryId,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
@@ -986,6 +994,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  registerIterateCommand,
   handleLaunchVerifyResult,
   formatLaunchFailureSummary,
   runningSubagents,
@@ -1019,7 +1028,11 @@ async function launchSubagent(
     };
     cwd: string;
   },
-  options?: { surface?: string },
+  options?: {
+    surface?: string;
+    forkFromEntryId?: string;
+    parentBranch?: SessionEntry[];
+  },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1052,14 +1065,6 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
-
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
@@ -1070,9 +1075,18 @@ async function launchSubagent(
       childCwd: targetCwdForSession,
       forkFromEntryId:
         launchBehavior.seededSessionMode === "fork"
-          ? getForkSourceEntryId(ctx.sessionManager.getBranch())
+          ? resolveForkFromEntryId(ctx.sessionManager.getBranch(), options?.forkFromEntryId)
           : undefined,
+      parentBranch: options?.parentBranch,
     });
+  }
+
+  // Create the terminal only after fallible session seeding succeeds so a
+  // malformed or unavailable parent session cannot leak an orphaned surface.
+  const surfacePreCreated = !!options?.surface;
+  const surface = options?.surface ?? createSurface(params.name);
+  if (!surfacePreCreated) {
+    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
@@ -1473,6 +1487,127 @@ async function watchSubagent(
   }
 }
 
+async function startManagedSubagent(
+  pi: ExtensionAPI,
+  params: Static<typeof SubagentParams>,
+  ctx: ExtensionContext,
+  options?: { forkFromEntryId?: string; parentBranch?: SessionEntry[] },
+): Promise<RunningSubagent> {
+  const running = await launchSubagent(params, ctx, options);
+
+  // Create a separate AbortController for the watcher
+  // (the initiating command/tool signal completes when it returns)
+  const watcherAbort = new AbortController();
+  running.abortController = watcherAbort;
+
+  startWidgetRefresh();
+  startStatusRefresh(pi);
+
+  void watchSubagent(running, watcherAbort.signal)
+    .then((result) => {
+      updateWidget();
+
+      if (result.ping) {
+        const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+        pi.sendMessage(
+          {
+            customType: "subagent_ping",
+            content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
+            display: true,
+            details: {
+              name: result.ping.name,
+              message: result.ping.message,
+              agent: running.agent,
+              sessionFile: result.sessionFile,
+            },
+          },
+          { triggerTurn: true, deliverAs: "steer" },
+        );
+        return;
+      }
+
+      const presentation = resolveResultPresentation(result, running.name);
+      pi.sendMessage(
+        {
+          customType: "subagent_result",
+          content: presentation,
+          display: true,
+          details: {
+            name: running.name,
+            task: running.task,
+            agent: running.agent,
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            sessionFile: result.sessionFile,
+            ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+            ...(result.error === "launch-failed"
+              ? {
+                  error: result.error,
+                  surface: running.surface,
+                  launchScriptFile: running.launchScriptFile,
+                }
+              : {}),
+            ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
+          },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    })
+    .catch((err) => {
+      updateWidget();
+      pi.sendMessage(
+        {
+          customType: "subagent_result",
+          content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+          display: true,
+          details: { name: running.name, task: running.task, error: err?.message },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    });
+
+  return running;
+}
+
+type IterateStarter = (
+  params: Static<typeof SubagentParams>,
+  ctx: ExtensionContext,
+  options: { forkFromEntryId: string; parentBranch: SessionEntry[] },
+) => Promise<Pick<RunningSubagent, "surface">>;
+
+function registerIterateCommand(pi: ExtensionAPI, start: IterateStarter): void {
+  pi.registerCommand("iterate", {
+    description: "Fork session into a subagent for focused work (bugfixes, iteration)",
+    handler: async (args, ctx) => {
+      const task =
+        args.trim() ||
+        "The user wants to do some hands-on work. Help them with whatever they need.";
+
+      try {
+        await ctx.waitForIdle();
+        const forkFromEntryId = ctx.sessionManager.getLeafId();
+        if (!forkFromEntryId) {
+          throw new Error("Cannot fork an empty session.");
+        }
+
+        const running = await start(
+          {
+            name: "Iterate",
+            task,
+            fork: true,
+            interactive: true,
+          },
+          ctx,
+          { forkFromEntryId, parentBranch: ctx.sessionManager.getBranch() },
+        );
+        ctx.ui.notify(`Iterate session started (${running.surface})`, "info");
+      } catch (err: any) {
+        ctx.ui.notify(`Could not start Iterate session: ${err?.message ?? String(err)}`, "error");
+      }
+    },
+  });
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
@@ -1566,83 +1701,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
-
-        // Create a separate AbortController for the watcher
-        // (the tool's signal completes when we return)
-        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
-
-        // Start widget refresh and status supervision when the first agent launches
-        startWidgetRefresh();
-        startStatusRefresh(pi);
-
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            updateWidget(); // reflect removal from Map immediately
-
-            if (result.ping) {
-              // Subagent is requesting help — steer a ping message with session path for resume
-              const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
-              pi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    agent: running.agent,
-                    sessionFile: result.sessionFile,
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
-
-            const presentation = resolveResultPresentation(result, running.name);
-
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.error === "launch-failed"
-                    ? {
-                        error: result.error,
-                        surface: running.surface,
-                        launchScriptFile: running.launchScriptFile,
-                      }
-                    : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
+        const running = await startManagedSubagent(pi, params, ctx);
 
         // Return immediately
         return {
@@ -2108,16 +2167,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // /iterate command — fork the session into a subagent
-  pi.registerCommand("iterate", {
-    description: "Fork session into a subagent for focused work (bugfixes, iteration)",
-    handler: async (args, _ctx) => {
-      const task = args.trim() || "";
-      const toolCall = task
-        ? `Use subagent to fork a session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
-        : `Use subagent to fork a session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
-      pi.sendUserMessage(toolCall);
-    },
+  // /iterate command — deterministically fork into an interactive subagent.
+  // Do not route this through the model: it may attach an autonomous agent
+  // definition whose auto-exit policy closes the hands-on session.
+  registerIterateCommand(pi, async (params, ctx, options) => {
+    if (!isMuxAvailable()) {
+      throw new Error(`Subagents require a supported terminal multiplexer. ${muxSetupHint()}`);
+    }
+    if (!ctx.sessionManager.getSessionFile()) {
+      throw new Error("No session file. Start pi with a persistent session to use subagents.");
+    }
+    return startManagedSubagent(pi, params, ctx, options);
   });
 
   // /subagent command — spawn a subagent by name

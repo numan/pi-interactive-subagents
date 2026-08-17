@@ -279,6 +279,17 @@ describe("session.ts", () => {
         ASSISTANT_MSG.id,
       );
     });
+
+    it("uses an explicit direct-command leaf instead of removing the latest real turn", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const branch = [MODEL_CHANGE, USER_MSG, ASSISTANT_MSG];
+
+      assert.equal(
+        testApi.resolveForkFromEntryId(branch, ASSISTANT_MSG.id),
+        ASSISTANT_MSG.id,
+      );
+      assert.equal(testApi.resolveForkFromEntryId(branch), MODEL_CHANGE.id);
+    });
   });
 
   describe("getNewEntries", () => {
@@ -487,6 +498,30 @@ describe("session.ts", () => {
       assert.equal(entries[1].type, "model_change");
       assert.equal(entries.some((entry) => entry.type === "session" && entry.parentSession !== parentFile), false);
       assert.equal(entries.some((entry) => entry.type === "message"), false);
+    });
+
+    it("creates a direct-command fork from an unflushed in-memory branch", () => {
+      const parentFile = join(dir, "not-yet-persisted-parent.jsonl");
+      const childFile = join(dir, "unflushed-parent-child.jsonl");
+
+      seedSubagentSessionFile({
+        mode: "fork",
+        parentSessionFile: parentFile,
+        childSessionFile: childFile,
+        childCwd: "/tmp/fork-child-cwd",
+        forkFromEntryId: ASSISTANT_MSG.id,
+        parentBranch: [MODEL_CHANGE, USER_MSG, ASSISTANT_MSG],
+      });
+
+      const entries = readFileSync(childFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.deepEqual(
+        entries.slice(1).map((entry) => entry.id),
+        [MODEL_CHANGE.id, USER_MSG.id, ASSISTANT_MSG.id],
+      );
+      assert.equal(entries[0].parentSession, parentFile);
     });
 
     it("forks from the selected branch point instead of the latest physical session entry", () => {
@@ -1433,19 +1468,69 @@ describe("cmux.ts interpretExitSidecar", () => {
   });
 });
 describe("commands", () => {
-  it("/iterate always emits a full-context fork tool call", () => {
+  it("/iterate directly starts an interactive bare fork", async () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+    const starts: Array<{
+      params: Record<string, unknown>;
+      ctx: unknown;
+      options: Record<string, unknown>;
+    }> = [];
+    let waitForIdleCalls = 0;
+    const parentBranch = [MODEL_CHANGE, USER_MSG, ASSISTANT_MSG];
+    const commandCtx = {
+      ui: { notify() {} },
+      sessionManager: {
+        getSessionFile: () => "/tmp/parent.jsonl",
+        getLeafId: () => ASSISTANT_MSG.id,
+        getBranch: () => parentBranch,
+      },
+      async waitForIdle() {
+        waitForIdleCalls += 1;
+      },
+    };
 
-    (subagentsModule as any).default(api);
+    (subagentsModule as any).__test__.registerIterateCommand(
+      api,
+      async (
+        params: Record<string, unknown>,
+        ctx: unknown,
+        options: Record<string, unknown>,
+      ) => {
+        starts.push({ params, ctx, options });
+        return { surface: "test-surface" };
+      },
+    );
 
     const iterate = registeredCommands.find((command) => command.name === "iterate");
     assert.ok(iterate, "expected /iterate to be registered");
 
-    iterate.handler("Fix the bug", {});
+    await iterate.handler("Fix the bug", commandCtx);
+    await iterate.handler("", commandCtx);
 
-    assert.equal(sentUserMessages.length, 1);
-    assert.match(sentUserMessages[0], /fork: true/);
-    assert.match(sentUserMessages[0], /name: "Iterate"/);
+    assert.equal(sentUserMessages.length, 0);
+    assert.equal(waitForIdleCalls, 2);
+    assert.deepEqual(starts, [
+      {
+        params: {
+          name: "Iterate",
+          task: "Fix the bug",
+          fork: true,
+          interactive: true,
+        },
+        ctx: commandCtx,
+        options: { forkFromEntryId: ASSISTANT_MSG.id, parentBranch },
+      },
+      {
+        params: {
+          name: "Iterate",
+          task: "The user wants to do some hands-on work. Help them with whatever they need.",
+          fork: true,
+          interactive: true,
+        },
+        ctx: commandCtx,
+        options: { forkFromEntryId: ASSISTANT_MSG.id, parentBranch },
+      },
+    ]);
   });
 });
 
