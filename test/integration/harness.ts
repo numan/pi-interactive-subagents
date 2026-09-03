@@ -162,8 +162,15 @@ export function getFocusedSurface(backend: MuxBackend): string | null {
 
   if (backend === "herdr") {
     try {
-      const info = execFileSync("herdr", ["pane", "current"], { encoding: "utf8" });
-      return JSON.parse(info)?.result?.pane?.pane_id ?? null;
+      const workspaceId = process.env.HERDR_WORKSPACE_ID;
+      if (!workspaceId) return null;
+      const info = execFileSync("herdr", ["pane", "list", "--workspace", workspaceId], {
+        encoding: "utf8",
+      });
+      const panes = JSON.parse(info)?.result?.panes;
+      return Array.isArray(panes)
+        ? panes.find((pane: { focused?: boolean; pane_id?: string }) => pane.focused)?.pane_id ?? null
+        : null;
     } catch {
       return null;
     }
@@ -183,6 +190,19 @@ export function getSurfacePane(backend: MuxBackend, surface: string): string | n
   if (backend === "herdr") return surface;
 
   throw new Error(`Pane lookup is not implemented for ${backend}`);
+}
+
+export function getHerdrPaneRect(surface: string): { x: number; y: number } | null {
+  const info = execFileSync("herdr", ["pane", "layout", "--pane", surface], {
+    encoding: "utf8",
+  });
+  const panes = JSON.parse(info)?.result?.layout?.panes;
+  const rect = Array.isArray(panes)
+    ? panes.find((pane: { pane_id?: string }) => pane.pane_id === surface)?.rect
+    : null;
+  return typeof rect?.x === "number" && typeof rect?.y === "number"
+    ? { x: rect.x, y: rect.y }
+    : null;
 }
 
 export async function waitForFocusedSurface(
