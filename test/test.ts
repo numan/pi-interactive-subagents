@@ -1652,7 +1652,7 @@ describe("cmux.ts interpretExitSidecar", () => {
   });
 });
 describe("commands", () => {
-  it("/iterate directly starts an interactive bare fork", async () => {
+  it("/iterate always starts a user-driven fork, with an optional task as its first message", async () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
     const starts: Array<{
       params: Record<string, unknown>;
@@ -1700,7 +1700,7 @@ describe("commands", () => {
           task: "Fix the bug",
           fork: true,
           interactive: true,
-          completionMode: "task",
+          completionMode: "user",
         },
         ctx: commandCtx,
         options: { forkFromEntryId: ASSISTANT_MSG.id, parentBranch },

@@ -1632,7 +1632,7 @@ function registerIterateCommand(pi: ExtensionAPI, start: IterateStarter): void {
             task,
             fork: true,
             interactive: true,
-            completionMode: args.trim() ? "task" : "user",
+            completionMode: "user",
           },
           ctx,
           { forkFromEntryId, parentBranch: ctx.sessionManager.getBranch() },

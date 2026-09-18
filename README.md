@@ -208,7 +208,7 @@ Pi-backed spawns have a separate `completionMode`:
 
 - `task` (default for delegated assignments): completion tools, intentional waits,
   and a bounded completion reminder are enabled. Agent `auto-exit` still applies.
-- `user` (used by bare `/iterate`): normal answers and questions leave the session
+- `user` (used by `/iterate` with or without a task): normal answers and questions leave the session
   open. There are no completion reminders or automatic exits, and `subagent_done`,
   `caller_ping`, and `subagent_wait` are not registered. End the session with `/quit`.
 
@@ -322,11 +322,11 @@ For quick, focused work without polluting the main session's context.
 
 This always forks the current session into a subagent with full conversation context. It does not inherit an agent default `session-mode`.
 
-With a task, `/iterate <task>` uses task mode: make the fix, verify it, and return a
-completion handoff to the main session. Bare `/iterate` uses user mode: it asks
-what you want to work on and stays open for your reply, without a completion
-reminder or an extra model request. Completed parent work is context, not a new
-assignment. Use `/quit` when you want to leave.
+Both `/iterate` and `/iterate <task>` use user mode and stay open until you exit.
+The only difference is the first message: `<task>` starts the requested work;
+without it, the session asks what you want to work on. Neither form enables
+completion reminders or model-driven exits. Completed parent work is context,
+not a new assignment. Use `/quit` when you want to leave.
 
 ---
 
