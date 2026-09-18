@@ -13,6 +13,9 @@ export interface MessageEntry extends SessionEntry {
   type: "message";
   message: {
     role: "user" | "assistant" | "toolResult";
+    toolName?: string;
+    isError?: boolean;
+    details?: { summary?: unknown };
     content: Array<{ type: string; text?: string; [key: string]: unknown }>;
   };
 }
@@ -172,7 +175,7 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
 }
 
 /**
- * Find the last assistant message text in a list of entries.
+ * Find the latest completion-tool handoff or assistant message text.
  *
  * Falls back to the `errorMessage` field when the last assistant message has
  * `stopReason: "error"` and no usable text content — this happens when
@@ -184,6 +187,10 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
     const entry = entries[i];
     if (entry.type !== "message") continue;
     const msg = entry as MessageEntry;
+    if (msg.message.role === "toolResult" && msg.message.toolName === "subagent_done" && !msg.message.isError) {
+      const summary = msg.message.details?.summary;
+      if (typeof summary === "string" && summary.trim()) return summary.trim();
+    }
     if (msg.message.role !== "assistant") continue;
 
     const texts = msg.message.content

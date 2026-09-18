@@ -65,7 +65,7 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). 
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 4 main-session tools + 3 commands, plus the task-mode child tools `subagent_done`, `subagent_wait`, and `caller_ping`:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -175,6 +175,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
+| `completionMode`       | string  | `task`         | Pi session lifetime: `task` enables completion tools and reminders for a bounded assignment; `user` stays open until you exit. Independent of `interactive`. |
 | `model`                | string  | —              | Override agent's default model                                                                    |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
@@ -201,9 +202,59 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 
 ---
 
+## Completion and intentional waits
+
+Pi-backed spawns have a separate `completionMode`:
+
+- `task` (default for delegated assignments): completion tools, intentional waits,
+  and a bounded completion reminder are enabled. Agent `auto-exit` still applies.
+- `user` (used by bare `/iterate`): normal answers and questions leave the session
+  open. There are no completion reminders or automatic exits, and `subagent_done`,
+  `caller_ping`, and `subagent_wait` are not registered. End the session with `/quit`.
+
+`interactive` continues to control only parent status notifications. It does not
+select the completion mode. Both launch and resume set
+`PI_SUBAGENT_COMPLETION_MODE` explicitly; without `task`, the child extension does
+not enforce completion.
+
+In task mode, when an assignment is complete, call
+`subagent_done({ summary: "..." })` as the final action. Include the full handoff in `summary`; the parent receives it
+without relying on a preceding assistant message. If you also display the
+handoff, emit it as commentary, not a final answer before the tool call.
+
+Legacy `subagent_done({})` calls still return the last assistant text. New calls
+should supply a nonblank summary. Completion and `caller_ping` return
+`terminate: true` so Pi does not request another assistant response after the
+handoff.
+
+If required user input or nested agent results are outstanding, call
+`subagent_wait({ reason: "Waiting for the reviewer." })` as the final action.
+This ends the current run but leaves the session open, including for auto-exit
+agents. New input or a child-result notification can resume it. Waiting does not
+notify the parent that the assignment is complete.
+
+A task-mode child without `auto-exit` that stops normally without a completion or
+wait action receives one follow-up reminder per user input, after queued work
+and retries settle. The
+reminder asks it to complete or explicitly wait; it never forces closure. Aborts,
+provider errors, truncated responses, and declared waits do not trigger it. If
+the child ignores the reminder, it stays open rather than looping. The reminder
+requires Pi's `agent_settled` event; terminating tools require `terminate` support
+(verified with Pi 0.85.1).
+
+Reload the parent extension and restart or resume existing children to use the
+updated tool schemas and completion handling.
+
+Run `npm test` for unit coverage and `npm run test:runtime` for deterministic
+completion tests against the installed `pi` executable. Runtime tests require
+Pi 0.85-compatible APIs, run in isolated config directories, and make no API
+calls or use real credentials. They do not require a terminal multiplexer.
+The runtime tests bypass the repository's older Pi dev dependency; set
+`PI_TEST_PI=/absolute/path/to/pi` to choose a specific executable.
+
 ## caller_ping — Child-to-Parent Help Request
 
-The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
+The `caller_ping` tool lets a task-mode subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
 
 **`caller_ping` parameters:**
 - `message` (required): What you need help with
@@ -212,7 +263,8 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `sessionPath` (required): Path to the child session `.jsonl` file
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
-- `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+- `completionMode` (optional): Preserve the session's recorded `task` or `user` mode unless overridden. Sessions created before this setting default to `task`; pass `user` when resuming an older open-ended session.
+- `autoExit` (optional): Whether a task-mode session should auto-exit after its next response. Defaults to `true`; set `false` to require an explicit completion call. User mode ignores this option and stays open until you exit.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
@@ -231,7 +283,7 @@ await caller_ping({
 // with guidance like "Use v2, v1 is deprecated"
 ```
 
-> **Note:** `caller_ping` is only available inside subagent contexts. Calling it from a standalone pi session returns an error.
+> **Note:** `caller_ping` is available only inside task-mode subagent contexts.
 
 ---
 
@@ -268,7 +320,13 @@ For quick, focused work without polluting the main session's context.
 /iterate Fix the off-by-one error in the pagination logic
 ```
 
-This always forks the current session into a subagent with full conversation context. It does not inherit an agent default `session-mode`. Make the fix, verify it, and exit to return. The main session gets a summary of what was done.
+This always forks the current session into a subagent with full conversation context. It does not inherit an agent default `session-mode`.
+
+With a task, `/iterate <task>` uses task mode: make the fix, verify it, and return a
+completion handoff to the main session. Bare `/iterate` uses user mode: it asks
+what you want to work on and stays open for your reply, without a completion
+reminder or an extra model request. Completed parent work is context, not a new
+assignment. Use `/quit` when you want to leave.
 
 ---
 
@@ -300,12 +358,12 @@ You are a specialized agent that does X...
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
-| `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
+| `tools`       | string  | Comma-separated Pi tool allowlist, including extension tools. In task mode, child control tools (`caller_ping`, `subagent_done`, `subagent_wait`) are added automatically.                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | In task mode, auto-shutdown when the agent finishes its run unless it aborts or calls `subagent_wait`. Explicit `subagent_done({summary})` is preferred for handoffs. Recommended for autonomous agents; also determines the default `interactive` value (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
@@ -335,13 +393,16 @@ session-mode: lineage-only
 
 ### `auto-exit`
 
-When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn — no explicit `subagent_done` call is needed.
+When set to `true` in task mode, the session shuts down automatically when the
+agent finishes its run. User mode disables auto-exit. Explicit
+`subagent_done({summary})` remains the preferred handoff.
 
 **Behavior:**
 
-- The session closes after the agent's final message (on the `agent_end` event)
-- If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
-- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
+- The session closes on `agent_end` unless the run was aborted or explicitly paused with `subagent_wait`.
+- Manual input does not disable auto-exit. Escape leaves the child open for inspection or another prompt.
+- Provider-error exits return failure information to the parent.
+- Task-mode child wrappers request an explicit completion handoff or intentional wait.
 
 **When to use:**
 
@@ -358,6 +419,9 @@ auto-exit: true
 ### `interactive`
 
 Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.
+
+This setting does not enable or disable auto-exit or completion reminders. Use
+`completionMode: "user"` on a Pi spawn for an open-ended session.
 
 **Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs (e.g. `/iterate` with `fork: true`) are treated as interactive.
 

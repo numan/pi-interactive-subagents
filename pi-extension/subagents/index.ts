@@ -87,6 +87,14 @@ function getModuleAbortSignal(): AbortSignal {
   return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
 }
 
+type CompletionMode = "task" | "user";
+
+const CompletionModeSchema = Type.Unsafe<CompletionMode>({
+  type: "string",
+  enum: ["task", "user"],
+  description: "Lifecycle policy, independent of interactive status notifications. task enables completion tools and reminders for a bounded assignment; user stays open until the user exits and has no model-driven exit tools. New delegated spawns default to task; resumes preserve the recorded mode.",
+});
+
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
@@ -124,6 +132,7 @@ const SubagentParams = Type.Object({
         "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
     }),
   ),
+  completionMode: Type.Optional(CompletionModeSchema),
   resumeSessionId: Type.Optional(
     Type.String({
       description:
@@ -742,7 +751,7 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done", "subagent_wait"] as const;
 
 /**
  * Build the child --tools allowlist.
@@ -752,7 +761,7 @@ const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
  * control tools from subagent-done.ts would otherwise be hidden, leaving a
  * manually resumed or user-touched subagent unable to call subagent_done.
  */
-function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
+function buildSubagentToolAllowlist(effectiveTools?: string, completionMode: CompletionMode = "task"): string | null {
   const requested = (effectiveTools ?? "")
     .split(",")
     .map((tool) => tool.trim())
@@ -761,8 +770,8 @@ function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   if (requested.length === 0) return null;
 
   const allow = new Set(requested);
-  for (const tool of SUBAGENT_CONTROL_TOOLS) {
-    allow.add(tool);
+  if (completionMode === "task") {
+    for (const tool of SUBAGENT_CONTROL_TOOLS) allow.add(tool);
   }
 
   return [...allow].join(",");
@@ -969,9 +978,29 @@ function startStatusRefresh(pi: ExtensionAPI) {
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
-function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit: boolean; interactive: boolean } {
-  const autoExit = params.autoExit ?? true;
-  return { autoExit, interactive: !autoExit };
+function buildSubagentLifecycleEnv(completionMode: CompletionMode, autoExit = false): string[] {
+  return [
+    `PI_SUBAGENT_COMPLETION_MODE=${completionMode}`,
+    `PI_SUBAGENT_AUTO_EXIT=${completionMode === "task" && autoExit ? "1" : "0"}`,
+  ];
+}
+
+function resolveResumeLaunchBehavior(
+  params: { autoExit?: boolean; completionMode?: CompletionMode },
+  entries: SessionEntry[] = [],
+): { autoExit: boolean; interactive: boolean; completionMode: CompletionMode } {
+  let savedMode: CompletionMode | undefined;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].type !== "custom" || entries[i].customType !== "subagent_lifecycle") continue;
+    const mode = (entries[i].data as { completionMode?: unknown } | undefined)?.completionMode;
+    if (mode === "task" || mode === "user") {
+      savedMode = mode;
+      break;
+    }
+  }
+  const completionMode = params.completionMode ?? savedMode ?? "task";
+  const autoExit = completionMode === "task" && (params.autoExit ?? true);
+  return { autoExit, interactive: !autoExit, completionMode };
 }
 
 export const __test__ = {
@@ -994,6 +1023,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  buildSubagentLifecycleEnv,
   registerIterateCommand,
   handleLaunchVerifyResult,
   formatLaunchFailureSummary,
@@ -1043,6 +1073,7 @@ async function launchSubagent(
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const completionMode = params.completionMode ?? "task";
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -1096,12 +1127,16 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
-    ? "Complete your task autonomously."
-    : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = agentDefs?.autoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+  const modeHint = completionMode === "user"
+    ? "Work interactively with the user. The session stays open until the user exits."
+    : agentDefs?.autoExit
+      ? "Complete your task autonomously."
+      : "Complete your task and return the handoff through subagent_done({summary}). The user can interact with you at any time.";
+  const summaryInstruction = completionMode === "user"
+    ? "If no task is specified, ask what the user wants to work on and wait for their reply."
+    : "When finished, call subagent_done({summary}) with the full handoff as your final action. " +
+      "Any preceding summary text must be commentary, not a final answer. " +
+      "If waiting for user input or required nested agent results, call subagent_wait({reason}) instead; do not claim completion.";
   const denySet = resolveDenyTools(agentDefs);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
@@ -1220,13 +1255,13 @@ async function launchSubagent(
     parts.push(flag, shellEscape(syspromptPath));
   }
 
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
+  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, completionMode);
   if (toolAllowlist) {
     parts.push("--tools", shellEscape(toolAllowlist));
   }
 
   // Build env prefix: denied tools + subagent identity + config dir propagation
-  const envParts: string[] = [];
+  const envParts = buildSubagentLifecycleEnv(completionMode, agentDefs?.autoExit);
 
   // If the target cwd has its own .pi/agent/, use that as the config root.
   // Otherwise propagate the current/global agent dir.
@@ -1242,9 +1277,6 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
-  }
-  if (agentDefs?.autoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
@@ -1360,6 +1392,7 @@ function copyClaudeSession(sentinelFile: string): string | null {
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  afterLine = 0,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
@@ -1411,10 +1444,13 @@ async function watchSubagent(
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
-    // Pi subagent result extraction
+    // Prefer the explicit handoff; the sidecar may arrive before the tool
+    // result is flushed to the transcript. Resumes only inspect new entries.
     let summary: string;
-    if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
+    if (result.summary) {
+      summary = result.summary;
+    } else if (existsSync(sessionFile)) {
+      const allEntries = getNewEntries(sessionFile, afterLine);
       summary =
         findLastAssistantMessage(allEntries) ??
         (result.errorMessage
@@ -1596,6 +1632,7 @@ function registerIterateCommand(pi: ExtensionAPI, start: IterateStarter): void {
             task,
             fork: true,
             interactive: true,
+            completionMode: args.trim() ? "task" : "user",
           },
           ctx,
           { forkFromEntryId, parentBranch: ctx.sessionManager.getBranch() },
@@ -1921,10 +1958,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             description: "Optional message to send after resuming (e.g. follow-up instructions)",
           }),
         ),
+        completionMode: Type.Optional(CompletionModeSchema),
         autoExit: Type.Optional(
           Type.Boolean({
             description:
-              "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
+              "Whether a task-mode resumed session should automatically exit after its response. Defaults to true; set false to require an explicit completion tool call. User mode always stays open until the user exits.",
           }),
         ),
       }),
@@ -1960,7 +1998,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const name = params.name ?? "Resume";
-        const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
@@ -1978,7 +2015,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Record entry count before resuming so we can extract new messages
-        const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
+        const previousEntries = getNewEntries(params.sessionPath, 0);
+        const entryCountBefore = previousEntries.length;
+        const { autoExit, interactive, completionMode } = resolveResumeLaunchBehavior(params, previousEntries);
 
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
@@ -2014,7 +2053,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
-        const resumeEnvParts: string[] = [];
+        const resumeEnvParts = buildSubagentLifecycleEnv(completionMode, autoExit);
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
         }
@@ -2022,9 +2061,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-        if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-        }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -2078,7 +2114,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(running, watcherAbort.signal, entryCountBefore)
           .then((result) => {
             updateWidget();
 
@@ -2100,21 +2136,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            // Launch failures carry a truthful summary already — don't replace
-            // it with "exited without new output" from the untouched session.
-            const summary = result.error === "launch-failed"
-              ? result.summary
-              : findLastAssistantMessage(allEntries) ??
-                (result.errorMessage
-                  ? `Subagent error: ${result.errorMessage}`
-                  : result.exitCode !== 0
-                    ? `Resumed session exited with code ${result.exitCode}`
-                    : "Resumed session exited without new output");
-            const presentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath },
-              name,
-            );
+            const presentation = resolveResultPresentation(result, name);
 
             pi.sendMessage(
               {

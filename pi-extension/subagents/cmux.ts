@@ -1503,6 +1503,8 @@ export interface PollResult {
   reason: "done" | "ping" | "sentinel" | "error";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
+  /** Explicit handoff supplied by subagent_done, available before transcript flush. */
+  summary?: string;
   /** Ping data if reason is "ping" */
   ping?: { name: string; message: string };
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
@@ -1529,7 +1531,8 @@ function interpretExitSidecar(data: any): PollResult {
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
-  return { reason: "done", exitCode: 0 };
+  const summary = data?.type === "done" && typeof data.summary === "string" ? data.summary.trim() : "";
+  return { reason: "done", exitCode: 0, ...(summary ? { summary } : {}) };
 }
 
 export const __pollForExitTest__ = { interpretExitSidecar };

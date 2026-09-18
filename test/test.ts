@@ -59,7 +59,7 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import {
+import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
@@ -326,6 +326,29 @@ describe("session.ts", () => {
       const entries = [ASSISTANT_MSG, TOOL_RESULT] as any[];
       const text = findLastAssistantMessage(entries);
       assert.equal(text, "Here is my plan...");
+    });
+
+    it("uses a successful completion-tool handoff instead of earlier commentary", () => {
+      const completion = {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "subagent_done",
+          content: [{ type: "text", text: "Shutting down subagent session." }],
+          details: { summary: "Delivered the plan and validation evidence." },
+          isError: false,
+        },
+      };
+      assert.equal(
+        findLastAssistantMessage([ASSISTANT_MSG, completion] as any[]),
+        "Delivered the plan and validation evidence.",
+      );
+      assert.equal(
+        findLastAssistantMessage([ASSISTANT_MSG, {
+          ...completion, message: { ...completion.message, isError: true },
+        }] as any[]),
+        "Here is my plan...",
+      );
     });
 
     it("returns null when no assistant messages", () => {
@@ -1208,7 +1231,7 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done",
+      "read,bash,web_search,caller_ping,subagent_done,subagent_wait",
     );
   });
 
@@ -1343,6 +1366,155 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  async function withCompletionHarness(
+    autoExit: boolean,
+    run: (harness: any) => Promise<void> | void,
+    completionMode = "task",
+  ) {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "child.jsonl");
+    const saved = process.env.PI_SUBAGENT_SESSION;
+    const savedAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+    const savedMode = process.env.PI_SUBAGENT_COMPLETION_MODE;
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    process.env.PI_SUBAGENT_AUTO_EXIT = autoExit ? "1" : "0";
+    if (completionMode === "unset") delete process.env.PI_SUBAGENT_COMPLETION_MODE;
+    else process.env.PI_SUBAGENT_COMPLETION_MODE = completionMode;
+    const mock = createMockExtensionApi();
+    let shutdowns = 0;
+    const ctx = { shutdown() { shutdowns++; }, hasPendingMessages: () => false };
+    try {
+      subagentDoneExtension(mock.api);
+      const fire = async (event: string, data: any = {}) => {
+        for (const handler of mock.registeredEvents.get(event) ?? []) await handler(data, ctx);
+      };
+      const tool = (name: string) => {
+        const registered = mock.registeredTools.find((tool) => tool.name === name);
+        assert.ok(registered, `${name} must be registered`);
+        return registered;
+      };
+      const stop = async (stopReason: string = "stop") => {
+        await fire("agent_end", { messages: [{ role: "assistant", stopReason }] });
+        await fire("agent_settled");
+      };
+      await fire("agent_start");
+      await run({ ...mock, ctx, fire, tool, stop, sessionFile, shutdowns: () => shutdowns });
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_SESSION", saved);
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", savedAutoExit);
+      restoreEnvVar("PI_SUBAGENT_COMPLETION_MODE", savedMode);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("requires explicit task mode before exposing completion tools or closing a child", async () => {
+    for (const mode of ["user", "unset"]) {
+      await withCompletionHarness(true, async ({ registeredTools, stop, sentMessages, shutdowns, sessionFile }) => {
+        assert.deepEqual(registeredTools.map((tool: any) => tool.name), []);
+        await stop();
+        assert.equal(sentMessages.length, 0);
+        assert.equal(shutdowns(), 0, "an inherited auto-exit flag must not close a user-driven session");
+        assert.equal(existsSync(`${sessionFile}.exit`), false);
+      }, mode);
+    }
+  });
+
+  it("returns the supplied handoff through the sidecar and a terminating tool result", async () => {
+    await withCompletionHarness(false, async ({ tool, ctx, sessionFile, shutdowns, stop, sentMessages }) => {
+      const result = await tool("subagent_done").execute("done", { summary: "  Plan ready.  " }, undefined, undefined, ctx);
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
+        type: "done", summary: "Plan ready.",
+      });
+      assert.equal(result.details.summary, "Plan ready.");
+      assert.equal(result.terminate, true);
+      assert.equal(shutdowns(), 1);
+      await stop();
+      assert.equal(sentMessages.length, 0, "never remind after an explicit exit");
+    });
+  });
+
+  it("keeps legacy empty-argument completion calls working", async () => {
+    await withCompletionHarness(false, async ({ tool, ctx, sessionFile }) => {
+      const result = await tool("subagent_done").execute("done", {}, undefined, undefined, ctx);
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
+      assert.equal(result.terminate, true);
+    });
+  });
+
+  it("rejects blank handoffs without closing the child", async () => {
+    await withCompletionHarness(false, async ({ tool, ctx, sessionFile, shutdowns }) => {
+      await assert.rejects(
+        tool("subagent_done").execute("done", { summary: "  " }, undefined, undefined, ctx),
+        /summary/i,
+      );
+      assert.equal(existsSync(`${sessionFile}.exit`), false);
+      assert.equal(shutdowns(), 0);
+    });
+  });
+
+  it("reminds once after a normal unmarked stop, rearming only on new input", async () => {
+    await withCompletionHarness(false, async ({ fire, stop, sentMessages, shutdowns }) => {
+      await stop();
+      assert.equal(sentMessages.length, 1);
+      assert.match(sentMessages[0].message.content, /subagent_done/);
+      assert.match(sentMessages[0].message.content, /subagent_wait/);
+      assert.deepEqual(sentMessages[0].options, { triggerTurn: true, deliverAs: "followUp" });
+      await fire("agent_start");
+      await stop();
+      assert.equal(sentMessages.length, 1, "no repeated reminder loop");
+      await fire("input", { source: "interactive" });
+      await fire("agent_start");
+      await stop();
+      assert.equal(sentMessages.length, 2);
+      assert.equal(shutdowns(), 0, "text-only stops never close a manual child");
+    });
+  });
+
+  for (const autoExit of [false, true]) {
+    it(`keeps an intentional wait open with auto-exit=${autoExit}, then resumes normal handling`, async () => {
+      await withCompletionHarness(autoExit, async ({ tool, ctx, stop, fire, sentMessages, shutdowns, sessionFile }) => {
+        const result = await tool("subagent_wait").execute("wait", { reason: "Waiting for the reviewer." }, undefined, undefined, ctx);
+        assert.equal(result.terminate, true);
+        await stop("toolUse");
+        assert.equal(shutdowns(), 0);
+        assert.equal(sentMessages.length, 0);
+        assert.equal(existsSync(`${sessionFile}.exit`), false);
+        // Child result notifications start a new run without an input event.
+        await fire("agent_start");
+        await stop();
+        assert.equal(shutdowns(), autoExit ? 1 : 0);
+        assert.equal(sentMessages.length, autoExit ? 0 : 1);
+      });
+    });
+  }
+
+  it("does not remind after aborts, provider errors, truncation, or tool-ending runs", async () => {
+    for (const reason of ["aborted", "error", "length", "toolUse"]) {
+      await withCompletionHarness(false, async ({ stop, sentMessages }) => {
+        await stop(reason);
+        assert.equal(sentMessages.length, 0, reason);
+      });
+    }
+  });
+
+  it("does not interrupt already queued follow-ups", async () => {
+    await withCompletionHarness(false, async ({ ctx, stop, sentMessages }) => {
+      ctx.hasPendingMessages = () => true;
+      await stop();
+      assert.equal(sentMessages.length, 0);
+    });
+  });
+
+  it("terminates caller_ping without queuing a completion reminder", async () => {
+    await withCompletionHarness(false, async ({ tool, ctx, stop, sentMessages, shutdowns }) => {
+      const result = await tool("caller_ping").execute("ping", { message: "Need parent guidance." }, undefined, undefined, ctx);
+      assert.equal(result.terminate, true);
+      await stop();
+      assert.equal(shutdowns(), 1);
+      assert.equal(sentMessages.length, 0);
+    });
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -1441,6 +1613,17 @@ describe("cmux.ts interpretExitSidecar", () => {
     });
   });
 
+  it("carries an explicit completion summary before transcript flushing", () => {
+    assert.deepEqual(interpretExitSidecar({ type: "done", summary: "Plan ready." }), {
+      reason: "done", exitCode: 0, summary: "Plan ready.",
+    });
+    for (const summary of [null, 42, "", "  "]) {
+      assert.deepEqual(interpretExitSidecar({ type: "done", summary }), {
+        reason: "done", exitCode: 0,
+      });
+    }
+  });
+
   it("decodes error payloads and propagates the message with a non-zero exit code", () => {
     assert.deepEqual(
       interpretExitSidecar({
@@ -1517,6 +1700,7 @@ describe("commands", () => {
           task: "Fix the bug",
           fork: true,
           interactive: true,
+          completionMode: "task",
         },
         ctx: commandCtx,
         options: { forkFromEntryId: ASSISTANT_MSG.id, parentBranch },
@@ -1527,6 +1711,7 @@ describe("commands", () => {
           task: "The user wants to do some hands-on work. Help them with whatever they need.",
           fork: true,
           interactive: true,
+          completionMode: "user",
         },
         ctx: commandCtx,
         options: { forkFromEntryId: ASSISTANT_MSG.id, parentBranch },
@@ -1542,11 +1727,40 @@ describe("tool registration", () => {
     assert.deepEqual(testApi.resolveResumeLaunchBehavior({}), {
       autoExit: true,
       interactive: false,
+      completionMode: "task",
     });
     assert.deepEqual(testApi.resolveResumeLaunchBehavior({ autoExit: false }), {
       autoExit: false,
       interactive: true,
+      completionMode: "task",
     });
+  });
+
+  it("preserves a user-driven lifecycle on resume unless explicitly changed", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const entries = [{ type: "custom", customType: "subagent_lifecycle", data: { completionMode: "user" } }];
+    assert.deepEqual(testApi.resolveResumeLaunchBehavior({ autoExit: true }, entries), {
+      autoExit: false, interactive: true, completionMode: "user",
+    });
+    assert.deepEqual(testApi.resolveResumeLaunchBehavior({ completionMode: "task" }, entries), {
+      autoExit: true, interactive: false, completionMode: "task",
+    });
+  });
+
+  it("writes explicit lifecycle environment values without changing notification policy", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.deepEqual(testApi.buildSubagentLifecycleEnv("user", true), [
+      "PI_SUBAGENT_COMPLETION_MODE=user", "PI_SUBAGENT_AUTO_EXIT=0",
+    ]);
+    assert.deepEqual(testApi.buildSubagentLifecycleEnv("task", false), [
+      "PI_SUBAGENT_COMPLETION_MODE=task", "PI_SUBAGENT_AUTO_EXIT=0",
+    ]);
+    assert.deepEqual(testApi.buildSubagentLifecycleEnv("task", true), [
+      "PI_SUBAGENT_COMPLETION_MODE=task", "PI_SUBAGENT_AUTO_EXIT=1",
+    ]);
+    assert.equal(testApi.buildSubagentToolAllowlist("read,bash", "user"), "read,bash");
+    assert.equal(testApi.resolveEffectiveInteractive({ interactive: true, completionMode: "task" }), true);
+    assert.equal(testApi.resolveEffectiveInteractive({ interactive: false, completionMode: "user" }), false);
   });
 
   it("expands spawning false to deny subagent interruption", () => {

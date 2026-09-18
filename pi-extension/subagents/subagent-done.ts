@@ -1,7 +1,7 @@
 /**
  * Extension loaded into sub-agents.
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
- * - Provides a `subagent_done` tool for autonomous agents to self-terminate
+ * - Provides explicit completion and wait actions plus a bounded completion reminder
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
@@ -84,7 +84,9 @@ export default function (pi: ExtensionAPI) {
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
-  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const completionMode = process.env.PI_SUBAGENT_COMPLETION_MODE === "task" ? "task" : "user";
+  const taskMode = completionMode === "task";
+  const autoExit = taskMode && process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -143,9 +145,16 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let exitRequested = false;
+  let waitRequested = false;
+  let completionReminderSent = false;
+  let lastStopReason: string | undefined;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    if (process.env.PI_SUBAGENT_SESSION) {
+      pi.appendEntry("subagent_lifecycle", { completionMode });
+    }
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -155,6 +164,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("input", () => {
+    completionReminderSent = false;
     recorder.input();
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
@@ -162,18 +172,30 @@ export default function (pi: ExtensionAPI) {
     userTookOver = true;
   });
 
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", (event) => {
     recorder.beforeAgentStart();
+    if (!taskMode) {
+      return {
+        systemPrompt: event.systemPrompt + "\n\nThis is a user-driven session, not a bounded delegated assignment. " +
+          "Inherited completed work is context, not a current assignment. " +
+          "If no new task is specified, ask what the user wants to work on and wait for their reply. " +
+          "Normal answers and questions leave this session open. The user ends it with /quit; do not initiate a completion handoff or exit.",
+      };
+    }
   });
 
   pi.on("agent_start", () => {
     agentStarted = true;
+    waitRequested = false;
+    lastStopReason = undefined;
     recorder.agentStart();
   });
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+    lastStopReason = messages?.findLast((message) => message?.role === "assistant")?.stopReason;
+    if (exitRequested) return;
+    const shouldExit = autoExit && !waitRequested && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -210,6 +232,22 @@ export default function (pi: ExtensionAPI) {
       // the latest agent turn completed normally, not by who initiated it.
       userTookOver = false;
     }
+  });
+
+  // Wait for retries and queued continuations to settle. Never turn an abort,
+  // provider error, or declared wait into a completion attempt.
+  pi.on("agent_settled", (_event, ctx) => {
+    if (!taskMode || autoExit || exitRequested || waitRequested || completionReminderSent ||
+        lastStopReason !== "stop" || ctx.hasPendingMessages()) return;
+    completionReminderSent = true;
+    pi.sendMessage({
+      customType: "subagent_completion_check",
+      content: "This subagent is still open. If the assignment is complete, call subagent_done({summary}) " +
+        "with the full handoff now; do not send a final answer first. If you are intentionally waiting " +
+        "for user input or nested agents, call subagent_wait({reason}) instead. Do not claim completion " +
+        "while required work or child results are outstanding. This is the only reminder for this input.",
+      display: false,
+    }, { triggerTurn: true, deliverAs: "followUp" });
   });
 
   pi.on("turn_start", (event) => {
@@ -265,6 +303,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // User-driven sessions end through the user's /quit, not a model decision.
+  if (!taskMode) return;
+
   pi.registerTool({
     name: "caller_ping",
     label: "Caller Ping",
@@ -291,11 +332,12 @@ export default function (pi: ExtensionAPI) {
         message: params.message,
       };
       writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
-
+      exitRequested = true;
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
         details: {},
+        terminate: true,
       };
     },
   });
@@ -304,20 +346,56 @@ export default function (pi: ExtensionAPI) {
     name: "subagent_done",
     label: "Subagent Done",
     description:
-      "Call this tool when you have completed your task. " +
-      "It will close this session and return your results to the main session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
-    parameters: Type.Object({}),
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      "Finish the assignment and close this session. Supply the full handoff in summary; " +
+      "it is returned directly to the parent. Call this as your final action, not after a final answer. " +
+      "Omitting summary preserves legacy behavior: the last assistant text becomes the handoff.",
+    promptSnippet: "Return the completed assignment and handoff to the parent",
+    promptGuidelines: [
+      "When a subagent assignment is complete, call subagent_done with the full summary as the final action. " +
+      "Any preceding handoff text must be commentary, not a final answer. " +
+      "Do not call subagent_done while required work or nested agent results remain outstanding.",
+    ],
+    parameters: Type.Object({
+      summary: Type.Optional(Type.String({ minLength: 1, description: "Full handoff, including results, verification, and remaining limitations" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const summary = params.summary?.trim();
+      if (params.summary !== undefined && !summary) throw new Error("summary must not be blank");
+      const handoff = summary ? { summary } : {};
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done", ...handoff }));
       }
+      exitRequested = true;
+      recorder.subagentDone();
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],
-        details: {},
+        details: handoff,
+        terminate: true,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_wait",
+    label: "Subagent Wait",
+    description: "Pause this run without closing the session while waiting for user input or nested agent results. " +
+      "This is not completion. New input or a child result can resume the session.",
+    promptSnippet: "Pause for user input or nested agents without completing the assignment",
+    promptGuidelines: [
+      "Use subagent_wait with a reason as the final action when intentionally waiting for user input or nested agents. " +
+      "Do not call subagent_done merely to stop a turn while waiting.",
+    ],
+    parameters: Type.Object({ reason: Type.String({ minLength: 1, description: "What input or child result is still needed" }) }),
+    async execute(_toolCallId, params) {
+      const reason = params.reason.trim();
+      if (!reason) throw new Error("reason must not be blank");
+      waitRequested = true;
+      return {
+        content: [{ type: "text", text: `Session remains open: ${reason}` }],
+        details: { reason },
+        terminate: true,
       };
     },
   });
