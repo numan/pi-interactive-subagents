@@ -1,6 +1,8 @@
 import { appendFileSync } from "node:fs";
 import {
   createAssistantMessageEventStream,
+  getCurrentSystemPrompt,
+  getCurrentTools,
   type AssistantMessage,
   type AssistantMessageEventStream,
   type Model,
@@ -102,9 +104,9 @@ export default function (pi: ExtensionAPI) {
           JSON.stringify(message).includes("This subagent is still open."),
         ).length;
         const forkContext = scenario === "user-fork" ? {
-          tools: (context.tools ?? []).map((tool) => tool.name),
+          tools: getCurrentTools(context.messages).map((tool) => tool.name),
           inheritedSummary: JSON.stringify(context.messages).includes("Onboarding is complete."),
-          userDrivenInstructions: context.systemPrompt?.includes("Inherited completed work is context, not a current assignment.") === true,
+          userDrivenInstructions: getCurrentSystemPrompt(context.messages).includes("Inherited completed work is context, not a current assignment."),
         } : {};
         appendFileSync(logFile, `${JSON.stringify({ request: requestCount, completionChecks, ...forkContext })}\n`);
       }
