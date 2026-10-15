@@ -65,6 +65,7 @@ import subagentDoneExtension, {
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
+import { formatCallerPingResumeGuidance } from "../pi-extension/subagents/lifecycle-guidance.ts";
 
 // --- Helpers ---
 
@@ -1365,6 +1366,21 @@ describe("subagent discovery", () => {
     });
   });
 });
+describe("caller ping resume guidance", () => {
+  it("directs the parent to resume the exited child with guidance and the exact session path", () => {
+    const sessionPath = '/tmp/child "review"\\session.jsonl';
+    const guidance = formatCallerPingResumeGuidance(sessionPath);
+    assert.match(guidance, /child exited after requesting help/);
+    assert.match(guidance, /reply in the parent conversation alone does not reach the child/);
+    const invocation = guidance.match(/subagent_resume\((\{.*\})\)/);
+    assert.ok(invocation, "expected an actionable subagent_resume call");
+    const args = JSON.parse(invocation[1]);
+    assert.equal(args.sessionPath, sessionPath);
+    assert.equal(typeof args.message, "string");
+    assert.ok(args.message.trim());
+  });
+});
+
 describe("subagent-done.ts", () => {
   async function withCompletionHarness(
     autoExit: boolean,
@@ -1419,6 +1435,24 @@ describe("subagent-done.ts", () => {
     }
   });
 
+  it("distinguishes parent help requests from local waits in tool guidance", async () => {
+    await withCompletionHarness(false, async ({ tool }) => {
+      const wait = tool("subagent_wait");
+      assert.match(wait.description, /without notifying the parent/i);
+      assert.match(wait.parameters.properties.reason.description, /not sent to the parent/i);
+      assert.match(wait.promptGuidelines.join(" "), /caller_ping/);
+      assert.match(wait.promptGuidelines.join(" "), /already-running nested agent/);
+      assert.match(wait.promptGuidelines.join(" "), /directly in this tab/);
+
+      const ping = tool("caller_ping");
+      assert.match(ping.promptSnippet, /parent/i);
+      assert.match(ping.promptGuidelines.join(" "), /decision, clarification, approval, or action/);
+      assert.match(ping.promptGuidelines.join(" "), /exits your session/);
+      assert.match(ping.description, /subagent_resume/);
+      assert.match(ping.parameters.properties.message.description, /blocker/i);
+    });
+  });
+
   it("returns the supplied handoff through the sidecar and a terminating tool result", async () => {
     await withCompletionHarness(false, async ({ tool, ctx, sessionFile, shutdowns, stop, sentMessages }) => {
       const result = await tool("subagent_done").execute("done", { summary: "  Plan ready.  " }, undefined, undefined, ctx);
@@ -1457,7 +1491,9 @@ describe("subagent-done.ts", () => {
       await stop();
       assert.equal(sentMessages.length, 1);
       assert.match(sentMessages[0].message.content, /subagent_done/);
+      assert.match(sentMessages[0].message.content, /caller_ping/);
       assert.match(sentMessages[0].message.content, /subagent_wait/);
+      assert.match(sentMessages[0].message.content, /does not notify the parent/);
       assert.deepEqual(sentMessages[0].options, { triggerTurn: true, deliverAs: "followUp" });
       await fire("agent_start");
       await stop();

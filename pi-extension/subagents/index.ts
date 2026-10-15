@@ -56,6 +56,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import { formatCallerPingResumeGuidance, TASK_LIFECYCLE_GUIDANCE } from "./lifecycle-guidance.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -1134,9 +1135,7 @@ async function launchSubagent(
       : "Complete your task and return the handoff through subagent_done({summary}). The user can interact with you at any time.";
   const summaryInstruction = completionMode === "user"
     ? "If no task is specified, ask what the user wants to work on and wait for their reply."
-    : "When finished, call subagent_done({summary}) with the full handoff as your final action. " +
-      "Any preceding summary text must be commentary, not a final answer. " +
-      "If waiting for user input or required nested agent results, call subagent_wait({reason}) instead; do not claim completion.";
+    : TASK_LIFECYCLE_GUIDANCE;
   const denySet = resolveDenyTools(agentDefs);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
@@ -1544,7 +1543,7 @@ async function startManagedSubagent(
       updateWidget();
 
       if (result.ping) {
-        const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+        const sessionRef = `\n\nSession: ${running.sessionFile}\n${formatCallerPingResumeGuidance(running.sessionFile)}`;
         pi.sendMessage(
           {
             customType: "subagent_ping",
@@ -2119,7 +2118,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             updateWidget();
 
             if (result.ping) {
-              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
+              const sessionRef = `\n\nSession: ${params.sessionPath}\n${formatCallerPingResumeGuidance(params.sessionPath)}`;
               pi.sendMessage(
                 {
                   customType: "subagent_ping",

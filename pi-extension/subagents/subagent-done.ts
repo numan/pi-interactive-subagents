@@ -8,6 +8,7 @@ import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { LOCAL_WAIT_GUIDANCE, PARENT_HELP_GUIDANCE, TASK_LIFECYCLE_GUIDANCE } from "./lifecycle-guidance.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -242,10 +243,7 @@ export default function (pi: ExtensionAPI) {
     completionReminderSent = true;
     pi.sendMessage({
       customType: "subagent_completion_check",
-      content: "This subagent is still open. If the assignment is complete, call subagent_done({summary}) " +
-        "with the full handoff now; do not send a final answer first. If you are intentionally waiting " +
-        "for user input or nested agents, call subagent_wait({reason}) instead. Do not claim completion " +
-        "while required work or child results are outstanding. This is the only reminder for this input.",
+      content: `This subagent is still open. ${TASK_LIFECYCLE_GUIDANCE} This is the only reminder for this input.`,
       display: false,
     }, { triggerTurn: true, deliverAs: "followUp" });
   });
@@ -311,10 +309,12 @@ export default function (pi: ExtensionAPI) {
     label: "Caller Ping",
     description:
       "Send a help request to the parent agent and exit this session. " +
-      "The parent will be notified with your message and can resume this session with a response. " +
-      "Use when you're stuck, need clarification, or need the parent to take action.",
+      "The parent receives your message and can resume this session with guidance using subagent_resume. " +
+      "Use when you need the parent's decision, clarification, approval, or action; subagent_wait does not notify the parent.",
+    promptSnippet: "Request help from the parent and exit until resumed with guidance",
+    promptGuidelines: [PARENT_HELP_GUIDANCE],
     parameters: Type.Object({
-      message: Type.String({ description: "What you need help with" }),
+      message: Type.String({ description: "The blocker and specific question or action needed from the parent" }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
@@ -380,14 +380,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent_wait",
     label: "Subagent Wait",
-    description: "Pause this run without closing the session while waiting for user input or nested agent results. " +
-      "This is not completion. New input or a child result can resume the session.",
-    promptSnippet: "Pause for user input or nested agents without completing the assignment",
-    promptGuidelines: [
-      "Use subagent_wait with a reason as the final action when intentionally waiting for user input or nested agents. " +
-      "Do not call subagent_done merely to stop a turn while waiting.",
-    ],
-    parameters: Type.Object({ reason: Type.String({ minLength: 1, description: "What input or child result is still needed" }) }),
+    description: "Pause locally without notifying the parent. Ends the current turn and keeps the session open " +
+      "for a reply from a user addressed in this tab or an already-running nested agent's result. " +
+      "This is not completion. Use caller_ping when the parent needs to act.",
+    promptSnippet: "Pause locally for expected input or nested results without notifying the parent",
+    promptGuidelines: [LOCAL_WAIT_GUIDANCE],
+    parameters: Type.Object({
+      reason: Type.String({ minLength: 1, description: "Local explanation of the expected input or nested-agent result; not sent to the parent" }),
+    }),
     async execute(_toolCallId, params) {
       const reason = params.reason.trim();
       if (!reason) throw new Error("reason must not be blank");

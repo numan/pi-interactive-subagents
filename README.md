@@ -227,11 +227,18 @@ should supply a nonblank summary. Completion and `caller_ping` return
 `terminate: true` so Pi does not request another assistant response after the
 handoff.
 
-If required user input or nested agent results are outstanding, call
-`subagent_wait({ reason: "Waiting for the reviewer." })` as the final action.
-This ends the current run but leaves the session open, including for auto-exit
-agents. New input or a child-result notification can resume it. Waiting does not
-notify the parent that the assignment is complete.
+If you need the parent's decision, clarification, approval, or action, call
+`caller_ping({ message: "..." })` as the final action. Include the blocker and
+specific question or requested action. This exits the child session and notifies
+the parent, which can use `subagent_resume` to send guidance.
+
+Use `subagent_wait({ reason: "Waiting for the reviewer." })` as the final action
+only when waiting for an already-running nested agent or a reply from a user you
+have addressed directly in the child tab. Before waiting, identify what input or
+result will resume you. This ends the current run but leaves the session open,
+including for auto-exit agents. New input or a child-result notification can resume it.
+Waiting does not notify the parent or send it the reason. If the parent must act
+first, use `caller_ping` instead.
 
 A task-mode child without `auto-exit` that stops normally without a completion or
 wait action receives one follow-up reminder per user input, after queued work
@@ -272,6 +279,9 @@ The `caller_ping` tool lets a task-mode subagent request help from its parent ag
 3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"*
 4. Parent resumes the child session via `subagent_resume` with the response
 5. Child picks up where it left off with the parent's guidance
+
+A reply in the parent conversation alone does not reach the child. Pass the
+response in `subagent_resume`'s `message` parameter.
 
 **Example:**
 ```typescript
